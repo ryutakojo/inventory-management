@@ -1,3 +1,5 @@
+import uuid
+from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
@@ -5,6 +7,8 @@ from pydantic import BaseModel
 from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders
 
 app = FastAPI(title="Factory Inventory Management System")
+
+RESTOCKING_LEAD_TIME_DAYS = 10
 
 # Quarter mapping for date filtering
 QUARTER_MAP = {
@@ -80,6 +84,7 @@ class Order(BaseModel):
     actual_delivery: Optional[str] = None
     warehouse: Optional[str] = None
     category: Optional[str] = None
+    lead_time_days: Optional[int] = None
 
 class DemandForecast(BaseModel):
     id: str
@@ -119,6 +124,109 @@ class CreatePurchaseOrderRequest(BaseModel):
     unit_cost: float
     expected_delivery_date: str
     notes: Optional[str] = None
+
+class RestockingRecommendationItem(BaseModel):
+    item_sku: str
+    item_name: str
+    current_demand: int
+    forecasted_demand: int
+    trend: str
+    unit_cost: float
+    recommended_quantity: int
+    line_cost: float
+    priority_rank: int
+    included: bool
+
+class RestockingExcludedItem(BaseModel):
+    item_sku: str
+    item_name: str
+    reason: str
+
+class RestockingRecommendationsResponse(BaseModel):
+    budget: float
+    recommended_items: List[RestockingRecommendationItem]
+    excluded_items: List[RestockingExcludedItem]
+    total_cost: float
+    remaining_budget: float
+
+class CreateRestockingOrderRequest(BaseModel):
+    budget: float
+    item_skus: List[str]
+
+def build_restocking_recommendations(budget: float) -> dict:
+    """Rank demand-forecast items by priority and greedily fill the given budget."""
+    if budget < 0:
+        raise HTTPException(status_code=400, detail="Budget must be a non-negative number")
+
+    # First-seen wins if a SKU repeats across warehouse rows
+    inventory_by_sku = {}
+    for inv in inventory_items:
+        if inv["sku"] not in inventory_by_sku:
+            inventory_by_sku[inv["sku"]] = inv
+
+    trend_rank = {"increasing": 0, "stable": 1, "decreasing": 2}
+
+    candidates = []
+    excluded_items = []
+    for forecast in demand_forecasts:
+        inv = inventory_by_sku.get(forecast["item_sku"])
+        if inv is None:
+            excluded_items.append({
+                "item_sku": forecast["item_sku"],
+                "item_name": forecast["item_name"],
+                "reason": "no_inventory_match"
+            })
+            continue
+
+        recommended_quantity = forecast["forecasted_demand"]
+        unit_cost = inv["unit_cost"]
+        line_cost = round(recommended_quantity * unit_cost, 2)
+        growth = forecast["forecasted_demand"] - forecast["current_demand"]
+
+        candidates.append({
+            "item_sku": forecast["item_sku"],
+            "item_name": forecast["item_name"],
+            "current_demand": forecast["current_demand"],
+            "forecasted_demand": forecast["forecasted_demand"],
+            "trend": forecast["trend"],
+            "unit_cost": unit_cost,
+            "recommended_quantity": recommended_quantity,
+            "line_cost": line_cost,
+            "_growth": growth,
+            "_trend_rank": trend_rank.get(forecast["trend"], 1)
+        })
+
+    # Highest demand growth first, then increasing > stable > decreasing, then SKU for determinism
+    candidates.sort(key=lambda c: (-c["_growth"], c["_trend_rank"], c["item_sku"]))
+
+    remaining_budget = round(budget, 2)
+    recommended_items = []
+    for rank, candidate in enumerate(candidates, start=1):
+        included = candidate["line_cost"] <= remaining_budget
+        if included:
+            remaining_budget = round(remaining_budget - candidate["line_cost"], 2)
+        recommended_items.append({
+            "item_sku": candidate["item_sku"],
+            "item_name": candidate["item_name"],
+            "current_demand": candidate["current_demand"],
+            "forecasted_demand": candidate["forecasted_demand"],
+            "trend": candidate["trend"],
+            "unit_cost": candidate["unit_cost"],
+            "recommended_quantity": candidate["recommended_quantity"],
+            "line_cost": candidate["line_cost"],
+            "priority_rank": rank,
+            "included": included
+        })
+
+    total_cost = round(budget - remaining_budget, 2)
+
+    return {
+        "budget": budget,
+        "recommended_items": recommended_items,
+        "excluded_items": excluded_items,
+        "total_cost": total_cost,
+        "remaining_budget": remaining_budget
+    }
 
 # API endpoints
 @app.get("/")
@@ -165,6 +273,71 @@ def get_order(order_id: str):
 def get_demand_forecasts():
     """Get demand forecasts"""
     return demand_forecasts
+
+@app.get("/api/restocking/recommendations", response_model=RestockingRecommendationsResponse)
+def get_restocking_recommendations(budget: float):
+    """Recommend demand-forecast items to restock within a given budget"""
+    return build_restocking_recommendations(budget)
+
+@app.post("/api/restocking-orders", response_model=Order, status_code=201)
+def create_restocking_order(payload: CreateRestockingOrderRequest):
+    """Submit a restocking order for the currently affordable recommended items"""
+    if payload.budget < 0:
+        raise HTTPException(status_code=400, detail="Budget must be a non-negative number")
+    if not payload.item_skus:
+        raise HTTPException(status_code=400, detail="At least one item must be selected for the order")
+
+    # Re-derive recommendations server-side rather than trusting client-sent costs/quantities
+    recommendations = build_restocking_recommendations(payload.budget)
+    included_by_sku = {
+        item["item_sku"]: item for item in recommendations["recommended_items"] if item["included"]
+    }
+
+    order_items = []
+    total_value = 0.0
+    for sku in payload.item_skus:
+        item = included_by_sku.get(sku)
+        if item is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"'{sku}' is not a currently affordable recommendation for the given budget"
+            )
+        order_items.append({
+            "sku": item["item_sku"],
+            "name": item["item_name"],
+            "quantity": item["recommended_quantity"],
+            "unit_price": item["unit_cost"]
+        })
+        total_value += item["line_cost"]
+    total_value = round(total_value, 2)
+
+    now = datetime.now()
+    expected_delivery = now + timedelta(days=RESTOCKING_LEAD_TIME_DAYS)
+
+    prefix = f"ORD-{now.year}-"
+    existing_seq = [
+        int(o["order_number"].rsplit("-", 1)[-1])
+        for o in orders
+        if o.get("order_number", "").startswith(prefix) and o["order_number"].rsplit("-", 1)[-1].isdigit()
+    ]
+    order_number = f"{prefix}{(max(existing_seq) + 1 if existing_seq else 1):04d}"
+
+    new_order = {
+        "id": str(uuid.uuid4()),
+        "order_number": order_number,
+        "customer": "Restocking Order",
+        "items": order_items,
+        "status": "Submitted",
+        "order_date": now.isoformat(),
+        "expected_delivery": expected_delivery.isoformat(),
+        "total_value": total_value,
+        "actual_delivery": None,
+        "warehouse": None,
+        "category": None,
+        "lead_time_days": RESTOCKING_LEAD_TIME_DAYS
+    }
+    orders.append(new_order)
+    return new_order
 
 @app.get("/api/backlog", response_model=List[BacklogItem])
 def get_backlog():
